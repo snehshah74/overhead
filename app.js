@@ -64,12 +64,14 @@ setInterval(() => ($('clock').textContent = new Date().toISOString().slice(0, 19
 
 // Every pass in the window, split across one worker per CPU core (started now, so they are warm by the first search).
 const pool = Array.from({ length: Math.min(navigator.hardwareConcurrency || 4, 8) }, () => new Worker('worker.js', { type: 'module' }));
+let runs = 0;
 async function passes(list, here, progress) {
-  const end = Date.now(), start = end - DAYS * 864e5, leo = list.filter((s) => !s.geo), byKey = new Map(leo.map((s) => [s.key, s]));
+  const end = Date.now(), start = end - DAYS * 864e5, leo = list.filter((s) => !s.geo), byKey = new Map(leo.map((s) => [s.key, s])), run = ++runs;
   let done = 0;
   const parts = await Promise.all(pool.map((w, i) => new Promise((ok) => {
-    w.onmessage = (e) => { progress(++done, pool.length); ok(e.data); };
-    w.postMessage({ tles: leo.filter((_, j) => j % pool.length === i).map((s) => [s.key, s.l1, s.l2, s.group, s.swath]), here, start, end });
+    w.onmessage = (e) => { if (e.data.run !== run) return; progress(++done, pool.length); ok(e.data.out); }; // ignore a slower, older search
+    // Plain numbers only: the globe attaches 3D objects to `here`, which cannot be sent to a worker.
+    w.postMessage({ run, tles: leo.filter((_, j) => j % pool.length === i).map((s) => [s.key, s.l1, s.l2, s.group, s.swath]), here: { lat: here.lat, lng: here.lng }, start, end });
   })));
   return parts.flat().map((p) => ({ ...p, s: byKey.get(p.key) })).sort((a, b) => b.at - a.at);
 }
