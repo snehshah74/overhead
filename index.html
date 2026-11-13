@@ -21,12 +21,15 @@
   <p class="kicker mono">Last 7 days · any place on Earth</p>
   <h1>Who looked down<br>at <em>your</em> place?</h1>
   <p class="lede">Pick a spot. See every Earth-watching satellite that passed over it this week, which ones actually took a picture, and the photo itself.</p>
-  <form id="search"><input id="q" placeholder="Search a city, landmark or address" aria-label="Place" autocomplete="off"><button aria-label="Search">→</button></form>
+  <form id="search"><input id="q" placeholder="Search any place on Earth" aria-label="Place" autocomplete="off" role="combobox" aria-controls="sugg" aria-expanded="false"><button aria-label="Search">→</button></form>
+  <ul id="sugg" role="listbox" hidden></ul>
   <div class="chips">
-    <button data-ll="40.7812,-73.9665" data-n="Central Park">Central Park</button>
-    <button data-ll="29.9792,31.1342" data-n="Giza pyramids">Giza</button>
-    <button data-ll="-1.2864,36.8172" data-n="Nairobi">Nairobi</button>
-    <button data-ll="37.3688,-122.0363" data-n="Sunnyvale">Sunnyvale</button>
+    <button data-ll="40.7128,-74.0060" data-n="New York">New York</button>
+    <button data-ll="34.0522,-118.2437" data-n="Los Angeles">Los Angeles</button>
+    <button data-ll="41.8781,-87.6298" data-n="Chicago">Chicago</button>
+    <button data-ll="29.7604,-95.3698" data-n="Houston">Houston</button>
+    <button data-ll="33.4484,-112.0740" data-n="Phoenix">Phoenix</button>
+    <button data-ll="37.7749,-122.4194" data-n="San Francisco">San Francisco</button>
     <button id="me">Near me</button>
   </div>
   <p class="hint mono">or click anywhere on the globe</p>
@@ -39,7 +42,7 @@
 
 <footer class="hud bottom mono">
   <span id="stats">Loading orbits…</span>
-  <span>Data: CelesTrak · Copernicus Sentinel-2 via Earth Search · OpenStreetMap</span>
+  <span>Data: CelesTrak · Copernicus Sentinel-2 via Earth Search · OpenStreetMap via Photon</span>
 </footer>
 <div id="tip" class="mono" hidden></div>
 <script type="module" src="app.js"></script>

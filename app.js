@@ -340,11 +340,39 @@ function timeline() {
 }
 
 // ---------- intro controls ----------
+// Place suggestions as you type: Photon (Komoot, OpenStreetMap data), free and built for autocomplete.
+let hits = [], pick = -1, typing;
+const showSugg = () => {
+  $('sugg').innerHTML = hits.map((h, i) => `<li role="option" data-i="${i}" class="${i === pick ? 'on' : ''}"><b>${esc(h.name)}</b><span>${esc(h.where)}</span></li>`).join('');
+  $('sugg').hidden = !hits.length; $('q').setAttribute('aria-expanded', String(hits.length > 0));
+};
+const choose = (h) => { hits = []; showSugg(); $('q').value = h.name; go(h.lat, h.lng, h.name); };
+$('q').oninput = () => {
+  clearTimeout(typing);
+  const q = $('q').value.trim();
+  if (q.length < 2) { hits = []; return showSugg(); }
+  typing = setTimeout(async () => {
+    const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6&lang=en`).then((x) => x.json()).catch(() => ({ features: [] }));
+    if ($('q').value.trim() !== q) return; // a newer keystroke won
+    hits = r.features.map((f) => ({ name: f.properties.name ?? q, where: [f.properties.city, f.properties.state, f.properties.country].filter((v) => v && v !== f.properties.name).join(', '), lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] }))
+      .filter((h, i, all) => all.findIndex((o) => o.name === h.name && o.where === h.where) === i);
+    pick = -1; showSugg();
+  }, 220);
+};
+$('q').onkeydown = (e) => {
+  if (!hits.length || !['ArrowDown', 'ArrowUp', 'Escape'].includes(e.key)) return;
+  e.preventDefault();
+  if (e.key === 'Escape') { hits = []; return showSugg(); }
+  pick = (pick + (e.key === 'ArrowDown' ? 1 : hits.length - 1)) % hits.length; showSugg();
+};
+$('sugg').onmousedown = (e) => { const li = e.target.closest('li'); if (li) choose(hits[li.dataset.i]); };
 $('search').onsubmit = async (e) => {
   e.preventDefault();
   const q = $('q').value.trim(); if (!q) return;
-  const [hit] = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`).then((r) => r.json()).catch(() => []);
-  hit ? go(+hit.lat, +hit.lon, hit.display_name.split(',').slice(0, 2).join(',')) : ($('q').value = '', $('q').placeholder = 'Not found. Try another place');
+  if (hits.length) return choose(hits[Math.max(pick, 0)]);
+  const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=1&lang=en`).then((x) => x.json()).catch(() => ({ features: [] }));
+  const f = r.features[0];
+  f ? go(f.geometry.coordinates[1], f.geometry.coordinates[0], f.properties.name ?? q) : ($('q').value = '', $('q').placeholder = 'Not found. Try another place');
 };
 document.querySelectorAll('[data-ll]').forEach((b) => (b.onclick = () => { const [la, ln] = b.dataset.ll.split(',').map(Number); go(la, ln, b.dataset.n); }));
 $('me').onclick = () => navigator.geolocation.getCurrentPosition((p) => go(p.coords.latitude, p.coords.longitude, 'Near you'));
