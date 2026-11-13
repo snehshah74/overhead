@@ -3,7 +3,7 @@
   --photo: #7cf2c8; --likely: #6aa8ff; --could: #c9a6ff; --over: #8a93a6;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 15px/1.55 "Space Grotesk", system-ui, sans-serif; overflow: hidden; }
+html, body { margin: 0; height: 100%; background: radial-gradient(1px 1px at 12% 22%, #fff9, transparent), radial-gradient(1px 1px at 68% 14%, #fff7, transparent), radial-gradient(1px 1px at 38% 78%, #fff8, transparent), radial-gradient(1.5px 1.5px at 84% 62%, #fffa, transparent), radial-gradient(1px 1px at 22% 58%, #fff6, transparent), radial-gradient(1px 1px at 92% 88%, #fff7, transparent), var(--bg); background-size: 340px 340px; color: var(--ink); font: 15px/1.55 "Space Grotesk", system-ui, sans-serif; overflow: hidden; }
 .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
 #globe { position: fixed; inset: 0; transform: translateX(18vw); transition: transform 1.2s ease; }
 body.results #globe { transform: translateX(-230px); }

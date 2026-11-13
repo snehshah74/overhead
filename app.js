@@ -1,7 +1,7 @@
-import * as sat from 'https://cdn.jsdelivr.net/npm/satellite.js@7.1.0/+esm';
 import Globe from 'https://cdn.jsdelivr.net/npm/globe.gl@2.46.2/+esm';
+import { sat, R, RAD, where, dist, elev } from './orbit.js';
 
-const DAYS = 7, STEP = 60e3, R = 6371, RAD = Math.PI / 180;
+const DAYS = 7;
 const GROUPS = ['resource', 'weather', 'planet'];
 const CATS = {
   photo: { t: 'Photographed', d: 'A real image of this spot is in a public archive. See it above.', c: '#7cf2c8' },
@@ -23,9 +23,8 @@ const operator = (n) => OPERATOR.find(([r]) => r.test(n))?.[1] ?? '';
 
 // ---------- globe ----------
 const globe = new Globe($('globe'))
-  .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/earth-blue-marble.jpg')
-  .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/earth-topology.png')
-  .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/night-sky.png')
+  .globeImageUrl('img/earth.jpg') // NASA Blue Marble, resized to 2048 px (446 KB instead of 1.4 MB)
+  .backgroundColor('rgba(0,0,0,0)') // stars are CSS, see style.css
   .atmosphereColor('#7cf2c8').atmosphereAltitude(0.18)
   .particleLat('lat').particleLng('lng').particleAltitude('alt').particlesSize(1.6).particlesColor(() => 'rgba(238,241,246,.75)')
   .ringColor(() => (t) => `rgba(124,242,200,${1 - t})`).ringMaxRadius(4).ringPropagationSpeed(2).ringRepeatPeriod(1400)
@@ -49,20 +48,11 @@ const sats = Promise.all(GROUPS.map(load)).then((texts) => {
     for (let i = 0; i + 2 < L.length; i += 3) {
       if (!L[i + 1].startsWith('1 ') || seen.has(L[i + 1].slice(2, 7))) continue;
       const rec = sat.twoline2satrec(L[i + 1], L[i + 2]), name = L[i].trim();
-      seen.set(L[i + 1].slice(2, 7), { name, rec, group: GROUPS[gi], geo: rec.no * 1440 / (2 * Math.PI) < 1.5, swath: SWATH.find(([r]) => r.test(name))?.[1] });
+      seen.set(L[i + 1].slice(2, 7), { key: L[i + 1].slice(2, 7), l1: L[i + 1], l2: L[i + 2], name, rec, group: GROUPS[gi], geo: rec.no * 1440 / (2 * Math.PI) < 1.5, swath: SWATH.find(([r]) => r.test(name))?.[1] });
     }
   });
   return [...seen.values()];
 });
-
-function where(rec, ms) {
-  const t = new Date(ms), pv = sat.propagate(rec, t);
-  if (!pv?.position) return null;
-  const g = sat.eciToGeodetic(pv.position, sat.gstime(t));
-  return { lat: g.latitude / RAD, lng: g.longitude / RAD, h: g.height, eci: pv.position, t };
-}
-const dist = (a, b) => { const s = Math.sin((b.lat - a.lat) * RAD / 2) ** 2 + Math.cos(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.sin((b.lng - a.lng) * RAD / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(s)); };
-const elev = (p, here) => sat.ecfToLookAngles({ latitude: here.lat * RAD, longitude: here.lng * RAD, height: 0 }, sat.eciToEcf(p.eci, sat.gstime(p.t))).elevation / RAD;
 
 // Live swarm: every satellite where it is right now.
 async function swarm() {
@@ -72,32 +62,16 @@ async function swarm() {
 sats.then((s) => { $('stats').textContent = `${s.length} Earth-watching satellites · orbits from CelesTrak`; swarm(); setInterval(swarm, 2000); });
 setInterval(() => ($('clock').textContent = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC'), 1000);
 
-// Closest approach of every pass in the window: ground distance from the spot to the point under the satellite.
+// Every pass in the window, split across one worker per CPU core (started now, so they are warm by the first search).
+const pool = Array.from({ length: Math.min(navigator.hardwareConcurrency || 4, 8) }, () => new Worker('worker.js', { type: 'module' }));
 async function passes(list, here, progress) {
-  const end = Date.now(), start = end - DAYS * 864e5, out = [];
-  for (const [i, s] of list.entries()) {
-    if (i % 20 === 0) { progress(i, list.length); await new Promise((r) => setTimeout(r)); }
-    if (s.geo) continue;
-    let prev = Infinity, falling = false;
-    for (let ms = start; ms <= end; ms += STEP) {
-      const p = where(s.rec, ms);
-      if (!p) break;
-      const d = dist(here, p);
-      if (d > prev && falling && prev < 3000) out.push(refine(s, here, ms - STEP));
-      falling = d < prev; prev = d;
-    }
-  }
-  return out.filter(Boolean).sort((a, b) => b.at - a.at);
-}
-function refine(s, here, ms) {
-  let best = null;
-  for (let t = ms - STEP; t <= ms + STEP; t += 5e3) {
-    const p = where(s.rec, t);
-    if (p) { const d = dist(here, p); if (!best || d < best.d) best = { d, p }; }
-  }
-  const e = elev(best.p, here), offNadir = Math.atan2(best.d, best.p.h) / RAD;
-  const cat = s.swath && best.d <= s.swath / 2 ? 'likely' : s.group !== 'weather' && offNadir <= 45 ? 'could' : e >= 30 ? 'over' : null;
-  return cat && { s, at: best.p.t.getTime(), d: best.d, h: best.p.h, offNadir, cat };
+  const end = Date.now(), start = end - DAYS * 864e5, leo = list.filter((s) => !s.geo), byKey = new Map(leo.map((s) => [s.key, s]));
+  let done = 0;
+  const parts = await Promise.all(pool.map((w, i) => new Promise((ok) => {
+    w.onmessage = (e) => { progress(++done, pool.length); ok(e.data); };
+    w.postMessage({ tles: leo.filter((_, j) => j % pool.length === i).map((s) => [s.key, s.l1, s.l2, s.group, s.swath]), here, start, end });
+  })));
+  return parts.flat().map((p) => ({ ...p, s: byKey.get(p.key) })).sort((a, b) => b.at - a.at);
 }
 
 // Geostationary weather satellites that see this spot all the time.
@@ -160,28 +134,32 @@ async function analyse(im) {
 const LABELS = { water: 'water', desert: 'desert', city: 'a city', farmland: 'farmland' };
 const LABEL_C = { water: '#3b8bd4', desert: '#e0b36a', city: '#e2564a', farmland: '#9bd35a' };
 const GRID = 6;
-let clip;
+// On a GPU with 16-bit support (WebGPU): ~4× faster than CPU and as accurate as the 8-bit CPU model in our tests.
+let model;
+const loadModel = () => (model ??= (async () => {
+  const gpu = (await navigator.gpu?.requestAdapter())?.features.has('shader-f16');
+  const spec = gpu ? { device: 'webgpu', dtype: 'fp16', name: 'CLIP ViT-B/32, 16-bit, GPU', mb: 303 } : { device: 'wasm', dtype: 'q8', name: 'CLIP ViT-B/32, 8-bit, CPU', mb: 154 };
+  const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/+esm');
+  return { ...spec, clip: await pipeline('zero-shot-image-classification', 'Xenova/clip-vit-base-patch32', { device: spec.device, dtype: spec.dtype }) };
+})());
 async function aiRead(im, say) {
   const t0 = performance.now();
-  if (!clip) {
-    say('Loading the vision model (154 MB, first time only, then cached)…');
-    const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/+esm');
-    clip = await pipeline('zero-shot-image-classification', 'Xenova/clip-vit-base-patch32');
-  }
-  const load = performance.now() - t0, tiles = [], c = document.createElement('canvas'), g = c.getContext('2d'), s = im.naturalWidth / GRID;
+  say('Loading the vision model (first time only, then cached)…');
+  const m = await loadModel();
+  const load = performance.now() - t0, tiles = [], urls = [], c = document.createElement('canvas'), g = c.getContext('2d'), s = im.naturalWidth / GRID;
   c.width = c.height = 224;
-  const t1 = performance.now();
   for (let y = 0; y < GRID; y++) for (let x = 0; x < GRID; x++) {
     g.drawImage(im, x * s, y * s, s, s, 0, 0, 224, 224);
     const px = g.getImageData(0, 0, 224, 224).data;
     let dark = 0; for (let i = 0; i < px.length; i += 16) dark += px[i] + px[i + 1] + px[i + 2] < 30;
     if (dark > px.length / 32) continue; // mostly outside the satellite's strip
-    say(`Model reading tile ${tiles.length + 1}…`);
-    const [top] = await clip(c.toDataURL('image/jpeg', 0.9), Object.values(LABELS).map((v) => `a satellite image of ${v}`));
-    tiles.push({ x, y, label: Object.keys(LABELS).find((k) => top.label.endsWith(LABELS[k])), score: top.score });
+    tiles.push({ x, y }); urls.push(c.toDataURL('image/jpeg', 0.9));
   }
+  say(`Model reading ${tiles.length} tiles at once…`);
+  const t1 = performance.now(), out = urls.length ? await m.clip(urls, Object.values(LABELS).map((v) => `a satellite image of ${v}`)) : [];
+  out.forEach(([top], i) => Object.assign(tiles[i], { label: Object.keys(LABELS).find((k) => top.label.endsWith(LABELS[k])), score: top.score }));
   const run = performance.now() - t1, pct = Object.fromEntries(Object.keys(LABELS).map((k) => [k, Math.round((tiles.filter((t) => t.label === k).length / Math.max(tiles.length, 1)) * 100)]));
-  return { tiles, pct, load, msPerTile: run / Math.max(tiles.length, 1) };
+  return { tiles, pct, load, msPerTile: run / Math.max(tiles.length, 1), name: m.name, mb: m.mb };
 }
 function aiMap(im, ai) {
   const c = $('aimap'), g = c.getContext('2d'), w = (c.width = c.height = 320) / GRID;
@@ -207,7 +185,7 @@ async function edgeLab(p) {
     </div>
     ${ai ? `<p class="mono">What the model saw</p><canvas id="aimap"></canvas>
     <div class="legend mono">${Object.keys(LABELS).map((k) => `<span><i style="background:${LABEL_C[k]}"></i>${k} ${ai.pct[k]}%</span>`).join('')}</div>
-    <div class="edge mono"><span>Model<b>CLIP ViT-B/32, 8-bit</b></span><span>Size<b>154 MB</b></span><span>Load<b>${(ai.load / 1000).toFixed(1)} s</b></span><span>Per tile<b>${Math.round(ai.msPerTile)} ms</b></span><span>Tiles<b>${ai.tiles.length}</b></span></div>
+    <div class="edge mono"><span>Model<b>${ai.name}</b></span><span>Size<b>${ai.mb} MB</b></span><span>Load<b>${(ai.load / 1000).toFixed(1)} s</b></span><span>Per tile<b>${Math.round(ai.msPerTile)} ms</b></span><span>Tiles<b>${ai.tiles.length}</b></span></div>
     <p class="d">The model labels the ground in each tile; cloud cover (${mix?.cloud ?? '?'}%) comes from the pixel rules, which catch bright cloud better. CLIP is a general image model, not trained on satellite photos, so expect some wrong tiles.</p>` : '<p class="d">The vision model could not run in this browser, so the answer uses the colour rules only.</p>'}
     <p class="mono">The answer, as it would be sent</p><pre>${esc(JSON.stringify(JSON.parse(answer), null, 1))}</pre>
     <p class="note">${Math.round((RAW_MB * 1e6) / bytes).toLocaleString()}× smaller${ansT && raw && ansT < raw.t ? `, and ${Math.round((raw.t - ansT) / 6e4)} min sooner` : ''}. Times come from real orbits over ${STATIONS.length} public ground stations. The tile size, link rates and station list are stated assumptions; the satellite-to-satellite hop is hypothetical, since these satellites don't relay for each other today. The model runs on this device on the downloaded preview, standing in for software running on the satellite's own computer.</p>`;
@@ -232,7 +210,7 @@ async function go(lat, lng, name) {
   $('panel').hidden = false;
   $('story').innerHTML = `<p class="mono">${lat.toFixed(4)}°, ${lng.toFixed(4)}°</p><div class="place">${esc(name)}</div><p class="big">Tracing a week of orbits…</p>`;
   const [list, imgs] = await Promise.all([sats, photos(here)]);
-  const ps = await passes(list, here, (i, n) => ($('story').querySelector('.big').textContent = `Tracing a week of orbits… ${i} of ${n} satellites`));
+  const ps = await passes(list, here, (i, n) => ($('story').querySelector('.big').textContent = `Tracing a week of orbits on ${n} cores… ${i} done`));
   for (const img of imgs) { // tie each archive photo to the pass that took it
     const p = ps.find((x) => x.s.name.startsWith(img.plat) && Math.abs(x.at - img.t) < 15 * 6e4);
     if (p) Object.assign(p, { cat: 'photo', img }); else img.orphan = true;
@@ -293,6 +271,7 @@ function bind(sats) {
     const p = state.ps.find((x) => x.img === m); if (p) replay(p);
   }));
   st.querySelectorAll('.sats li[data-n]').forEach((li) => (li.onclick = () => replay(state.ps.filter((p) => p.s.name === li.dataset.n).sort((a, b) => 'plco'.indexOf(a.cat[0]) - 'plco'.indexOf(b.cat[0]) || a.d - b.d)[0])));
+  if ($('runlab')) new IntersectionObserver((e, o) => { if (e[0].isIntersecting) { o.disconnect(); loadModel(); } }).observe($('runlab')); // warm the model while they read
   $('runlab')?.addEventListener('click', () => { const sel = state.imgs[st.querySelector('.strip img.on').dataset.i], p = state.ps.find((x) => x.img === sel) ?? state.ps.find((x) => x.img); replay(p); edgeLab(p); });
   $('more')?.addEventListener('click', (e) => { e.target.remove(); st.querySelector('.sats').innerHTML = sats.map(satRow).join(''); bind(sats); });
 }
