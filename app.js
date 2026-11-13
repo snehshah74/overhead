@@ -137,7 +137,7 @@ async function relay(self, from, until, list) {
 }
 // A few pixel rules on the real photo: the kind of tiny filter that fits on a satellite computer. Rules, not a trained model.
 async function analyse(img) {
-  const im = new Image(); im.crossOrigin = 'anonymous'; im.src = `${img.src}?pixels`; // separate cache entry from the plain <img> copy await im.decode();
+  const im = new Image(); im.crossOrigin = 'anonymous'; im.src = `${img.src}?pixels`; await im.decode(); // ?pixels: separate cache entry from the plain <img> copy
   const c = document.createElement('canvas'); c.width = c.height = 200;
   const g = c.getContext('2d'); g.drawImage(im, 0, 0, 200, 200);
   const px = g.getImageData(0, 0, 200, 200).data, n = { cloud: 0, water: 0, vegetation: 0, land: 0 };
