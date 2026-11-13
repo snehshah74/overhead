@@ -21,6 +21,6 @@ Then open http://localhost:8000.
 Push to GitHub, then Settings → Pages → Deploy from branch → `main`, folder `/`. The "Refresh orbits" action then updates `data/` daily; run it once from the Actions tab to refresh straight away.
 
 ## Credits
-Orbital data: CelesTrak. Imagery: contains modified Copernicus Sentinel data, processed by ESA, via Earth Search on AWS Open Data. Search: © OpenStreetMap contributors.
+Orbital data: CelesTrak. Imagery: contains modified Copernicus Sentinel data, processed by ESA, via Earth Search on AWS Open Data. Search: © OpenStreetMap contributors. Visits are counted with cookie-free Cloudflare Web Analytics.
 
 MIT licensed.
