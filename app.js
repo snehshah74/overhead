@@ -136,8 +136,11 @@ async function relay(self, from, until, list) {
   return null;
 }
 // A few pixel rules on the real photo: the kind of tiny filter that fits on a satellite computer. Rules, not a trained model.
-async function analyse(img) {
+async function photoPixels(img) {
   const im = new Image(); im.crossOrigin = 'anonymous'; im.src = `${img.src}?pixels`; await im.decode(); // ?pixels: separate cache entry from the plain <img> copy
+  return im;
+}
+async function analyse(im) {
   const c = document.createElement('canvas'); c.width = c.height = 200;
   const g = c.getContext('2d'); g.drawImage(im, 0, 0, 200, 200);
   const px = g.getImageData(0, 0, 200, 200).data, n = { cloud: 0, water: 0, vegetation: 0, land: 0 };
@@ -151,13 +154,49 @@ async function analyse(img) {
   return Object.fromEntries(Object.entries(n).map(([k, v]) => [k, Math.round((v / Math.max(seen, 1)) * 100)]));
 }
 
+// A real vision model, run on this device the way a model would run on the satellite's computer.
+// CLIP is a general image model (not trained on satellite photos): it picks the best caption for each tile.
+// Short labels tested best on real tiles; "forest" and "clouds" pulled too many tiles, so cloud cover comes from the pixel rules.
+const LABELS = { water: 'water', desert: 'desert', city: 'a city', farmland: 'farmland' };
+const LABEL_C = { water: '#3b8bd4', desert: '#e0b36a', city: '#e2564a', farmland: '#9bd35a' };
+const GRID = 6;
+let clip;
+async function aiRead(im, say) {
+  const t0 = performance.now();
+  if (!clip) {
+    say('Loading the vision model (154 MB, first time only, then cached)…');
+    const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/+esm');
+    clip = await pipeline('zero-shot-image-classification', 'Xenova/clip-vit-base-patch32');
+  }
+  const load = performance.now() - t0, tiles = [], c = document.createElement('canvas'), g = c.getContext('2d'), s = im.naturalWidth / GRID;
+  c.width = c.height = 224;
+  const t1 = performance.now();
+  for (let y = 0; y < GRID; y++) for (let x = 0; x < GRID; x++) {
+    g.drawImage(im, x * s, y * s, s, s, 0, 0, 224, 224);
+    const px = g.getImageData(0, 0, 224, 224).data;
+    let dark = 0; for (let i = 0; i < px.length; i += 16) dark += px[i] + px[i + 1] + px[i + 2] < 30;
+    if (dark > px.length / 32) continue; // mostly outside the satellite's strip
+    say(`Model reading tile ${tiles.length + 1}…`);
+    const [top] = await clip(c.toDataURL('image/jpeg', 0.9), Object.values(LABELS).map((v) => `a satellite image of ${v}`));
+    tiles.push({ x, y, label: Object.keys(LABELS).find((k) => top.label.endsWith(LABELS[k])), score: top.score });
+  }
+  const run = performance.now() - t1, pct = Object.fromEntries(Object.keys(LABELS).map((k) => [k, Math.round((tiles.filter((t) => t.label === k).length / Math.max(tiles.length, 1)) * 100)]));
+  return { tiles, pct, load, msPerTile: run / Math.max(tiles.length, 1) };
+}
+function aiMap(im, ai) {
+  const c = $('aimap'), g = c.getContext('2d'), w = (c.width = c.height = 320) / GRID;
+  g.drawImage(im, 0, 0, 320, 320);
+  for (const t of ai.tiles) { g.globalAlpha = 0.38; g.fillStyle = LABEL_C[t.label]; g.fillRect(t.x * w, t.y * w, w, w); g.globalAlpha = 1; g.strokeStyle = 'rgba(0,0,0,.35)'; g.strokeRect(t.x * w, t.y * w, w, w); }
+}
+
 async function edgeLab(p) {
   const box = $('lab');
   box.innerHTML = '<p class="big">Following the data down…</p>';
   const list = await sats, raw = contact(p.s.rec, p.at);
   const hop = raw && (await relay(p.s, p.at, raw.t, list));
-  const mix = await analyse(p.img).catch(() => null);
-  const answer = JSON.stringify({ place: [+state.here.lat.toFixed(3), +state.here.lng.toFixed(3)], seen: new Date(p.at).toISOString().slice(0, 16), by: p.s.name, ...(mix ? { pct: mix } : {}) });
+  const im = await photoPixels(p.img).catch(() => null), mix = im && (await analyse(im));
+  const ai = im && (await aiRead(im, (t) => (box.innerHTML = `<p class="big">${t}</p>`)).catch((e) => (console.error(e), null)));
+  const answer = JSON.stringify({ place: [+state.here.lat.toFixed(3), +state.here.lng.toFixed(3)], seen: new Date(p.at).toISOString().slice(0, 16), by: p.s.name, ...(mix ? { cloud: mix.cloud } : {}), ...(ai ? { ground: ai.pct } : mix ? { pct: mix } : {}) });
   const bytes = new Blob([answer]).size, ansT = hop ? hop.t : raw?.t;
   const mins = (t) => (t ? `${Math.max(1, Math.round((t - p.at) / 6e4))} min` : 'over 6 h');
   globe.arcsData([raw && { a: raw.p, b: raw.st, c: '#6aa8ff' }, hop && { a: hop.me, b: hop.p, c: '#7cf2c8' }, hop && { a: hop.p, b: hop.st, c: '#7cf2c8' }].filter(Boolean));
@@ -166,8 +205,13 @@ async function edgeLab(p) {
       <div><p class="mono">Send the pixels</p><b class="num">${RAW_MB} MB</b><p>One full tile, all 13 bands. It waits for a big dish: <b>${raw ? esc(raw.st.n) : 'none in 6 h'}</b>, ${mins(raw?.t)} after capture, then ~${Math.round((RAW_MB * 8) / X_BAND_MBPS)} s at ${X_BAND_MBPS} Mbit/s, behind everything else queued.</p></div>
       <div><p class="mono">Send the answer</p><b class="num">${bytes.toLocaleString()} B</b><p>${hop ? `Hops to <b>${esc(hop.via.name)}</b>, which is already talking to <b>${esc(hop.st.n)}</b>: down ${mins(hop.t)} after capture.` : `Rides the same first contact, ${mins(raw?.t)} after capture.`} Even a slow ${LOW_KBPS} kbit/s link moves it in ${((bytes * 8) / (LOW_KBPS * 1000)).toFixed(1)} s.</p></div>
     </div>
+    ${ai ? `<p class="mono">What the model saw</p><canvas id="aimap"></canvas>
+    <div class="legend mono">${Object.keys(LABELS).map((k) => `<span><i style="background:${LABEL_C[k]}"></i>${k} ${ai.pct[k]}%</span>`).join('')}</div>
+    <div class="edge mono"><span>Model<b>CLIP ViT-B/32, 8-bit</b></span><span>Size<b>154 MB</b></span><span>Load<b>${(ai.load / 1000).toFixed(1)} s</b></span><span>Per tile<b>${Math.round(ai.msPerTile)} ms</b></span><span>Tiles<b>${ai.tiles.length}</b></span></div>
+    <p class="d">The model labels the ground in each tile; cloud cover (${mix?.cloud ?? '?'}%) comes from the pixel rules, which catch bright cloud better. CLIP is a general image model, not trained on satellite photos, so expect some wrong tiles.</p>` : '<p class="d">The vision model could not run in this browser, so the answer uses the colour rules only.</p>'}
     <p class="mono">The answer, as it would be sent</p><pre>${esc(JSON.stringify(JSON.parse(answer), null, 1))}</pre>
-    <p class="note">${Math.round((RAW_MB * 1e6) / bytes).toLocaleString()}× smaller${ansT && raw && ansT < raw.t ? `, and ${Math.round((raw.t - ansT) / 6e4)} min sooner` : ''}. Times come from real orbits over ${STATIONS.length} public ground stations. The tile size, link rates and station list are stated assumptions; the satellite-to-satellite hop is hypothetical, since these satellites don't relay for each other today. The answer comes from simple colour rules run on the downloaded preview, standing in for software running onboard.</p>`;
+    <p class="note">${Math.round((RAW_MB * 1e6) / bytes).toLocaleString()}× smaller${ansT && raw && ansT < raw.t ? `, and ${Math.round((raw.t - ansT) / 6e4)} min sooner` : ''}. Times come from real orbits over ${STATIONS.length} public ground stations. The tile size, link rates and station list are stated assumptions; the satellite-to-satellite hop is hypothetical, since these satellites don't relay for each other today. The model runs on this device on the downloaded preview, standing in for software running on the satellite's own computer.</p>`;
+  if (ai) aiMap(im, ai);
 }
 
 // ---------- sun, for the timeline's daylight bands ----------
