@@ -14,6 +14,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .logo { font-size: 18px; font-weight: 600; } .logo i { color: var(--photo); font-style: normal; }
 
 #intro { position: fixed; left: 6vw; top: 50%; transform: translateY(-50%); width: min(470px, 88vw); z-index: 2; transition: opacity .5s, transform .5s; }
+#intro { pointer-events: none; } /* drags and scrolls on the text reach the globe; only the controls take clicks */
+#intro form, #intro .chips, #intro #sugg { pointer-events: auto; }
 #intro.gone { opacity: 0; transform: translate(-30px, -50%); pointer-events: none; }
 h1 { font-size: clamp(40px, 6vw, 68px); line-height: 1.02; margin: 10px 0 18px; font-weight: 600; letter-spacing: -.02em; }
 h1 em { color: var(--photo); font-style: normal; }
@@ -81,7 +83,8 @@ pre { background: rgba(0,0,0,.4); border: 1px solid var(--line); border-radius: 
 
 @media (max-width: 760px) {
   html, body { overflow: auto; }
-  #globe, body.results #globe { transform: none; }
+  #globe { transform: translateY(-18vh); } /* globe above the headline */
+  body.results #globe { transform: translateY(-29vh); } /* the chosen place sits in the open area above the panel */
   #intro { top: auto; bottom: 64px; transform: none; left: 5vw; } #intro.gone { transform: translateY(20px); }
   h1 { font-size: 40px; }
   #panel { top: 42vh; left: 8px; right: 8px; width: auto; bottom: 8px; }

@@ -207,7 +207,7 @@ async function go(lat, lng, name) {
   const here = { lat, lng };
   history.replaceState(null, '', `?q=${lat.toFixed(4)},${lng.toFixed(4)}&n=${encodeURIComponent(name)}`);
   globe.controls().autoRotate = false;
-  globe.pointOfView({ lat, lng, altitude: 1.4 }, 1600).ringsData([here]).pathsData([]).pointsData([{ lat, lng, c: '#7cf2c8', alt: 0.005, r: 0.35 }]);
+  globe.pointOfView({ lat, lng, altitude: 0.7 }, 1600).ringsData([here]).pathsData([]).pointsData([{ lat, lng, c: '#7cf2c8', alt: 0.005, r: 0.35 }]);
   $('intro').classList.add('gone'); document.body.className = 'results';
   $('panel').hidden = false;
   $('story').innerHTML = `<p class="mono">${lat.toFixed(4)}°, ${lng.toFixed(4)}°</p><div class="place">${esc(name)}</div><p class="big">Tracing a week of orbits…</p>`;
@@ -285,7 +285,7 @@ function replay(p) {
   document.querySelectorAll('.sats li').forEach((li) => li.classList.toggle('on', li.dataset.n === p.s.name));
   const track = [];
   for (let t = p.at - 48e4; t <= p.at + 48e4; t += 1e4) { const w = where(p.s.rec, t); if (w) track.push([w.lat, w.lng, w.h / R]); }
-  globe.pathsData([track]).pointOfView({ lat: state.here.lat, lng: state.here.lng, altitude: 1.1 }, 900);
+  globe.pathsData([track]).pointOfView({ lat: state.here.lat, lng: state.here.lng, altitude: 0.9 }, 900);
   const c = CATS[p.cat].c, t0 = performance.now(), base = { lat: state.here.lat, lng: state.here.lng, c: '#7cf2c8', alt: 0.005, r: 0.35 };
   const step = (now) => {
     const k = ((now - t0) % 6000) / 6000, w = where(p.s.rec, p.at - 48e4 + k * 96e4);
