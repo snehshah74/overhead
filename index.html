@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overhead</title>
+<meta name="description" content="Who looked down at your place this week? Every Earth-watching satellite pass over any spot on Earth, and the real photos they took.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="globe"></div>
+
+<header class="hud top">
+  <b class="logo">Overhead<i>.</i></b>
+  <span id="clock" class="mono"></span>
+</header>
+
+<section id="intro">
+  <p class="kicker mono">Last 7 days · any place on Earth</p>
+  <h1>Who looked down<br>at <em>your</em> place?</h1>
+  <p class="lede">Pick a spot. See every Earth-watching satellite that passed over it this week, which ones actually took a picture, and the photo itself.</p>
+  <form id="search"><input id="q" placeholder="Search a city, landmark or address" aria-label="Place" autocomplete="off"><button aria-label="Search">→</button></form>
+  <div class="chips">
+    <button data-ll="40.7812,-73.9665" data-n="Central Park">Central Park</button>
+    <button data-ll="29.9792,31.1342" data-n="Giza pyramids">Giza</button>
+    <button data-ll="-1.2864,36.8172" data-n="Nairobi">Nairobi</button>
+    <button data-ll="37.3688,-122.0363" data-n="Sunnyvale">Sunnyvale</button>
+    <button id="me">Near me</button>
+  </div>
+  <p class="hint mono">or click anywhere on the globe</p>
+</section>
+
+<aside id="panel" hidden>
+  <button id="back" class="mono">← new place</button>
+  <div id="story"></div>
+</aside>
+
+<footer class="hud bottom mono">
+  <span id="stats">Loading orbits…</span>
+  <span>Data: CelesTrak · Copernicus Sentinel-2 via Earth Search · OpenStreetMap</span>
+</footer>
+<div id="tip" class="mono" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,309 @@
+import * as sat from 'https://cdn.jsdelivr.net/npm/satellite.js@7.1.0/+esm';
+import Globe from 'https://cdn.jsdelivr.net/npm/globe.gl@2.46.2/+esm';
+
+const DAYS = 7, STEP = 60e3, R = 6371, RAD = Math.PI / 180;
+const GROUPS = ['resource', 'weather', 'planet'];
+const CATS = {
+  photo: { t: 'Photographed', d: 'A real image of this spot is in a public archive. See it above.', c: '#7cf2c8' },
+  likely: { t: 'Likely imaged', d: 'A camera that always looks straight down swept over this spot. Its pictures are not published here.', c: '#6aa8ff' },
+  could: { t: 'Could have looked', d: 'A camera that can be pointed was in range. Its operator does not say whether it did.', c: '#c9a6ff' },
+  over: { t: 'Passed high overhead', d: 'Climbed above 30° in your sky, but its camera was not aimed at you.', c: '#8a93a6' },
+};
+// Fixed cameras that always image a strip below them: name pattern → strip width in km.
+const SWATH = [[/^SENTINEL-2/, 290], [/^LANDSAT/, 185], [/^(TERRA|AQUA)$/, 2330], [/^(SUOMI NPP|NOAA 2[01])/, 3000], [/^SENTINEL-3/, 1270], [/^(METOP|NOAA 1[589])/, 2900], [/^FENGYUN 3/, 2800]];
+const OPERATOR = [[/^SENTINEL/, 'ESA · Copernicus'], [/^LANDSAT/, 'NASA · USGS'], [/^(TERRA|AQUA)/, 'NASA'], [/^SUOMI/, 'NASA · NOAA'], [/^(NOAA|GOES)/, 'NOAA'], [/^(METOP|METEOSAT)/, 'EUMETSAT'], [/^(FENGYUN|FY)/, 'CMA'], [/^GAOFEN/, 'CNSA'], [/^(FLOCK|SKYSAT|PLANET)/, 'Planet'], [/^WORLDVIEW|^GEOEYE/, 'Maxar'], [/^(CARTOSAT|RESOURCESAT|OCEANSAT|RISAT|EOS)/, 'ISRO'], [/^JILIN/, 'Chang Guang'], [/^HIMAWARI/, 'JMA'], [/^ELEKTRO|^METEOR|^KANOPUS|^RESURS/, 'Roscosmos'], [/^KOMPSAT/, 'KARI'], [/^ICEYE/, 'ICEYE'], [/^CAPELLA/, 'Capella Space'], [/^(SPOT|PLEIADES)/, 'Airbus'], [/^ALOS|^GCOM/, 'JAXA'], [/^CBERS/, 'INPE · CAST'], [/^(TERRASAR|TANDEM)/, 'DLR']];
+// Public, well-known polar ground stations (approximate). Assumption for the edge lab, not any operator's real schedule.
+const STATIONS = [['Svalbard', 78.23, 15.40], ['Kiruna', 67.88, 21.06], ['Inuvik', 68.32, -133.55], ['Fairbanks', 64.86, -147.85], ['Troll, Antarctica', -72.01, 2.53], ['Punta Arenas', -52.94, -70.85], ['Matera', 40.65, 16.70], ['Maspalomas', 27.76, -15.63], ['Wallops', 37.94, -75.46], ['Hartebeesthoek', -25.89, 27.69], ['Alice Springs', -23.76, 133.88]].map(([n, lat, lng]) => ({ n, lat, lng }));
+const RAW_MB = 800, X_BAND_MBPS = 520, LOW_KBPS = 9.6; // typical Sentinel-2 L1C tile size; its published X-band rate; a small UHF-class link
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+const ago = (ms) => { const h = (Date.now() - ms) / 36e5; return h < 1 ? `${Math.max(1, Math.round(h * 60))} min ago` : h < 48 ? `${Math.round(h)} h ago` : `${Math.round(h / 24)} days ago`; };
+const day = (ms) => new Date(ms).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+const operator = (n) => OPERATOR.find(([r]) => r.test(n))?.[1] ?? '';
+
+// ---------- globe ----------
+const globe = new Globe($('globe'))
+  .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/earth-blue-marble.jpg')
+  .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/earth-topology.png')
+  .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.6/example/img/night-sky.png')
+  .atmosphereColor('#7cf2c8').atmosphereAltitude(0.18)
+  .particleLat('lat').particleLng('lng').particleAltitude('alt').particlesSize(1.6).particlesColor(() => 'rgba(238,241,246,.75)')
+  .ringColor(() => (t) => `rgba(124,242,200,${1 - t})`).ringMaxRadius(4).ringPropagationSpeed(2).ringRepeatPeriod(1400)
+  .pointColor('c').pointAltitude('alt').pointRadius('r').pointsMerge(false)
+  .arcStartLat((d) => d.a.lat).arcStartLng((d) => d.a.lng).arcEndLat((d) => d.b.lat).arcEndLng((d) => d.b.lng).arcColor('c').arcStroke(0.6).arcDashLength(0.4).arcDashGap(0.15).arcDashAnimateTime(1500).arcAltitudeAutoScale(0.3)
+  .pathPointLat((p) => p[0]).pathPointLng((p) => p[1]).pathPointAlt((p) => p[2]).pathColor(() => ['rgba(124,242,200,.1)', '#7cf2c8', 'rgba(124,242,200,.1)']).pathStroke(2).pathTransitionDuration(0)
+  .onGlobeClick(({ lat, lng }) => go(lat, lng, `${lat.toFixed(3)}°, ${lng.toFixed(3)}°`));
+globe.controls().autoRotate = true; globe.controls().autoRotateSpeed = 0.35;
+globe.pointOfView({ lat: 20, lng: 10, altitude: 2.6 });
+new ResizeObserver(() => globe.width(innerWidth).height(innerHeight)).observe(document.body);
+
+// ---------- orbits ----------
+const load = async (g) => {
+  const local = await fetch(`data/${g}.txt`).then((r) => (r.ok ? r.text() : '')).catch(() => '');
+  return local.includes('\n1 ') ? local : fetch(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${g}&FORMAT=tle`).then((r) => r.text());
+};
+const sats = Promise.all(GROUPS.map(load)).then((texts) => {
+  const seen = new Map();
+  texts.forEach((text, gi) => {
+    const L = text.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean);
+    for (let i = 0; i + 2 < L.length; i += 3) {
+      if (!L[i + 1].startsWith('1 ') || seen.has(L[i + 1].slice(2, 7))) continue;
+      const rec = sat.twoline2satrec(L[i + 1], L[i + 2]), name = L[i].trim();
+      seen.set(L[i + 1].slice(2, 7), { name, rec, group: GROUPS[gi], geo: rec.no * 1440 / (2 * Math.PI) < 1.5, swath: SWATH.find(([r]) => r.test(name))?.[1] });
+    }
+  });
+  return [...seen.values()];
+});
+
+function where(rec, ms) {
+  const t = new Date(ms), pv = sat.propagate(rec, t);
+  if (!pv?.position) return null;
+  const g = sat.eciToGeodetic(pv.position, sat.gstime(t));
+  return { lat: g.latitude / RAD, lng: g.longitude / RAD, h: g.height, eci: pv.position, t };
+}
+const dist = (a, b) => { const s = Math.sin((b.lat - a.lat) * RAD / 2) ** 2 + Math.cos(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.sin((b.lng - a.lng) * RAD / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(s)); };
+const elev = (p, here) => sat.ecfToLookAngles({ latitude: here.lat * RAD, longitude: here.lng * RAD, height: 0 }, sat.eciToEcf(p.eci, sat.gstime(p.t))).elevation / RAD;
+
+// Live swarm: every satellite where it is right now.
+async function swarm() {
+  const now = Date.now();
+  globe.particlesData([(await sats).map((s) => where(s.rec, now)).filter(Boolean).map((p) => ({ lat: p.lat, lng: p.lng, alt: Math.min(p.h / R, 0.9) }))]);
+}
+sats.then((s) => { $('stats').textContent = `${s.length} Earth-watching satellites · orbits from CelesTrak`; swarm(); setInterval(swarm, 2000); });
+setInterval(() => ($('clock').textContent = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC'), 1000);
+
+// Closest approach of every pass in the window: ground distance from the spot to the point under the satellite.
+async function passes(list, here, progress) {
+  const end = Date.now(), start = end - DAYS * 864e5, out = [];
+  for (const [i, s] of list.entries()) {
+    if (i % 20 === 0) { progress(i, list.length); await new Promise((r) => setTimeout(r)); }
+    if (s.geo) continue;
+    let prev = Infinity, falling = false;
+    for (let ms = start; ms <= end; ms += STEP) {
+      const p = where(s.rec, ms);
+      if (!p) break;
+      const d = dist(here, p);
+      if (d > prev && falling && prev < 3000) out.push(refine(s, here, ms - STEP));
+      falling = d < prev; prev = d;
+    }
+  }
+  return out.filter(Boolean).sort((a, b) => b.at - a.at);
+}
+function refine(s, here, ms) {
+  let best = null;
+  for (let t = ms - STEP; t <= ms + STEP; t += 5e3) {
+    const p = where(s.rec, t);
+    if (p) { const d = dist(here, p); if (!best || d < best.d) best = { d, p }; }
+  }
+  const e = elev(best.p, here), offNadir = Math.atan2(best.d, best.p.h) / RAD;
+  const cat = s.swath && best.d <= s.swath / 2 ? 'likely' : s.group !== 'weather' && offNadir <= 45 ? 'could' : e >= 30 ? 'over' : null;
+  return cat && { s, at: best.p.t.getTime(), d: best.d, h: best.p.h, offNadir, cat };
+}
+
+// Geostationary weather satellites that see this spot all the time.
+const watchers = (list, here) => list.filter((s) => s.geo).map((s) => ({ s, p: where(s.rec, Date.now()) })).filter((x) => x.p && elev(x.p, here) > 5).map((x) => ({ ...x, e: elev(x.p, here) }));
+
+async function photos(here) {
+  const body = { collections: ['sentinel-2-l2a'], intersects: { type: 'Point', coordinates: [here.lng, here.lat] }, datetime: `${new Date(Date.now() - DAYS * 864e5).toISOString()}/${new Date().toISOString()}`, limit: 20 };
+  const r = await fetch('https://earth-search.aws.element84.com/v1/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null);
+  return r?.ok ? (await r.json()).features.map((f) => ({ t: Date.parse(f.properties.datetime), plat: f.properties.platform.toUpperCase(), cloud: Math.round(f.properties['eo:cloud_cover']), src: f.assets.thumbnail.href })) : [];
+}
+
+// ---------- edge lab: pixels vs. answers ----------
+// First moment after `from` that the satellite is 5°+ above a ground station's horizon.
+function contact(rec, from, limit = 6 * 36e5) {
+  for (let t = from; t < from + limit; t += 3e4) {
+    const p = where(rec, t);
+    const st = p && STATIONS.find((s) => elev(p, s) >= 5);
+    if (st) return { st, t, p };
+  }
+  return null;
+}
+// Could the answer hop through another satellite that is talking to a ground station sooner?
+async function relay(self, from, until, list) {
+  for (let t = from; t < until; t += 6e4) {
+    const me = where(self.rec, t);
+    if (!me) continue;
+    for (const o of list) {
+      if (o === self || o.geo) continue;
+      const p = where(o.rec, t);
+      if (!p || Math.hypot(p.eci.x - me.eci.x, p.eci.y - me.eci.y, p.eci.z - me.eci.z) > 3000) continue;
+      const st = STATIONS.find((s) => elev(p, s) >= 5);
+      if (st) return { via: o, st, t, me, p };
+    }
+    await new Promise((r) => setTimeout(r));
+  }
+  return null;
+}
+// A few pixel rules on the real photo: the kind of tiny filter that fits on a satellite computer. Rules, not a trained model.
+async function analyse(img) {
+  const im = new Image(); im.crossOrigin = 'anonymous'; im.src = `${img.src}?pixels`; // separate cache entry from the plain <img> copy await im.decode();
+  const c = document.createElement('canvas'); c.width = c.height = 200;
+  const g = c.getContext('2d'); g.drawImage(im, 0, 0, 200, 200);
+  const px = g.getImageData(0, 0, 200, 200).data, n = { cloud: 0, water: 0, vegetation: 0, land: 0 };
+  let seen = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    const [r, gr, b] = [px[i], px[i + 1], px[i + 2]], hi = Math.max(r, gr, b), lo = Math.min(r, gr, b);
+    if (hi < 10) continue; // outside the satellite's strip
+    seen++;
+    n[hi > 185 && hi - lo < 40 ? 'cloud' : b >= r && b >= gr - 6 && hi < 110 ? 'water' : gr > r && gr >= b ? 'vegetation' : 'land']++;
+  }
+  return Object.fromEntries(Object.entries(n).map(([k, v]) => [k, Math.round((v / Math.max(seen, 1)) * 100)]));
+}
+
+async function edgeLab(p) {
+  const box = $('lab');
+  box.innerHTML = '<p class="big">Following the data down…</p>';
+  const list = await sats, raw = contact(p.s.rec, p.at);
+  const hop = raw && (await relay(p.s, p.at, raw.t, list));
+  const mix = await analyse(p.img).catch(() => null);
+  const answer = JSON.stringify({ place: [+state.here.lat.toFixed(3), +state.here.lng.toFixed(3)], seen: new Date(p.at).toISOString().slice(0, 16), by: p.s.name, ...(mix ? { pct: mix } : {}) });
+  const bytes = new Blob([answer]).size, ansT = hop ? hop.t : raw?.t;
+  const mins = (t) => (t ? `${Math.max(1, Math.round((t - p.at) / 6e4))} min` : 'over 6 h');
+  globe.arcsData([raw && { a: raw.p, b: raw.st, c: '#6aa8ff' }, hop && { a: hop.me, b: hop.p, c: '#7cf2c8' }, hop && { a: hop.p, b: hop.st, c: '#7cf2c8' }].filter(Boolean));
+  box.innerHTML = `
+    <div class="duel">
+      <div><p class="mono">Send the pixels</p><b class="num">${RAW_MB} MB</b><p>One full tile, all 13 bands. It waits for a big dish: <b>${raw ? esc(raw.st.n) : 'none in 6 h'}</b>, ${mins(raw?.t)} after capture, then ~${Math.round((RAW_MB * 8) / X_BAND_MBPS)} s at ${X_BAND_MBPS} Mbit/s, behind everything else queued.</p></div>
+      <div><p class="mono">Send the answer</p><b class="num">${bytes.toLocaleString()} B</b><p>${hop ? `Hops to <b>${esc(hop.via.name)}</b>, which is already talking to <b>${esc(hop.st.n)}</b>: down ${mins(hop.t)} after capture.` : `Rides the same first contact, ${mins(raw?.t)} after capture.`} Even a slow ${LOW_KBPS} kbit/s link moves it in ${((bytes * 8) / (LOW_KBPS * 1000)).toFixed(1)} s.</p></div>
+    </div>
+    <p class="mono">The answer, as it would be sent</p><pre>${esc(JSON.stringify(JSON.parse(answer), null, 1))}</pre>
+    <p class="note">${Math.round((RAW_MB * 1e6) / bytes).toLocaleString()}× smaller${ansT && raw && ansT < raw.t ? `, and ${Math.round((raw.t - ansT) / 6e4)} min sooner` : ''}. Times come from real orbits over ${STATIONS.length} public ground stations. The tile size, link rates and station list are stated assumptions; the satellite-to-satellite hop is hypothetical, since these satellites don't relay for each other today. The answer comes from simple colour rules run on the downloaded preview, standing in for software running onboard.</p>`;
+}
+
+// ---------- sun, for the timeline's daylight bands ----------
+function sunUp(here, ms) {
+  const d = ms / 864e5 - 10957.5, g = (357.529 + 0.98560028 * d) * RAD, L = (280.459 + 0.98564736 * d + 1.915 * Math.sin(g) + 0.02 * Math.sin(2 * g)) * RAD, e = 23.439 * RAD;
+  const ra = Math.atan2(Math.cos(e) * Math.sin(L), Math.cos(L)), dec = Math.asin(Math.sin(e) * Math.sin(L)), ha = sat.gstime(new Date(ms)) + here.lng * RAD - ra;
+  return Math.sin(here.lat * RAD) * Math.sin(dec) + Math.cos(here.lat * RAD) * Math.cos(dec) * Math.cos(ha) > 0;
+}
+
+// ---------- story ----------
+let state = null;
+async function go(lat, lng, name) {
+  const here = { lat, lng };
+  history.replaceState(null, '', `?q=${lat.toFixed(4)},${lng.toFixed(4)}&n=${encodeURIComponent(name)}`);
+  globe.controls().autoRotate = false;
+  globe.pointOfView({ lat, lng, altitude: 1.4 }, 1600).ringsData([here]).pathsData([]).pointsData([{ lat, lng, c: '#7cf2c8', alt: 0.005, r: 0.35 }]);
+  $('intro').classList.add('gone'); document.body.className = 'results';
+  $('panel').hidden = false;
+  $('story').innerHTML = `<p class="mono">${lat.toFixed(4)}°, ${lng.toFixed(4)}°</p><div class="place">${esc(name)}</div><p class="big">Tracing a week of orbits…</p>`;
+  const [list, imgs] = await Promise.all([sats, photos(here)]);
+  const ps = await passes(list, here, (i, n) => ($('story').querySelector('.big').textContent = `Tracing a week of orbits… ${i} of ${n} satellites`));
+  for (const img of imgs) { // tie each archive photo to the pass that took it
+    const p = ps.find((x) => x.s.name.startsWith(img.plat) && Math.abs(x.at - img.t) < 15 * 6e4);
+    if (p) Object.assign(p, { cat: 'photo', img }); else img.orphan = true;
+  }
+  state = { here, name, ps, imgs: imgs.sort((a, b) => a.cloud - b.cloud), geo: watchers(list, here), filter: null };
+  render();
+}
+
+function render() {
+  const { here, name, ps, imgs, geo, filter } = state;
+  const count = (c) => ps.filter((p) => p.cat === c).length;
+  const sats = Object.values(ps.reduce((m, p) => { (m[p.s.name] ??= { s: p.s, ps: [] }).ps.push(p); return m; }, {}))
+    .map((g) => ({ ...g, cat: ['photo', 'likely', 'could', 'over'].find((c) => g.ps.some((p) => p.cat === c)), close: Math.min(...g.ps.map((p) => p.d)) }))
+    .filter((g) => !filter || g.ps.some((p) => p.cat === filter))
+    .sort((a, b) => 'plco'.indexOf(a.cat[0]) - 'plco'.indexOf(b.cat[0]) || b.ps.length - a.ps.length);
+  const best = imgs[0];
+  $('story').innerHTML = `
+    <p class="mono">${here.lat.toFixed(4)}°, ${here.lng.toFixed(4)}°</p>
+    <div class="place">${esc(name)}</div>
+    <p class="big">In the last 7 days, <b>${new Set(ps.map((p) => p.s.name)).size}</b> satellites came over ${esc(name)}.</p>
+    <p class="mono">${ps.length} passes · ${imgs.length} public photo${imgs.length === 1 ? '' : 's'} · ${geo.length} watching nonstop</p>
+    ${best ? `<h3 class="mono"><span>The clearest look</span><span>${imgs.length} photos</span></h3>
+      <figure class="hero" style="margin:0"><img id="heroimg" src="${esc(best.src)}" alt="Sentinel-2 photo of ${esc(name)}">
+        <figcaption><b id="herocap">${esc(best.plat)} · ${day(best.t)}</b><span class="mono" id="herosub">${best.cloud}% cloud · 10 m per pixel · ${ago(best.t)} · hover to zoom</span></figcaption></figure>
+      <div class="strip">${imgs.map((m, i) => `<img src="${esc(m.src)}" data-i="${i}" class="${i ? '' : 'on'}" alt="">`).join('')}</div>
+      ${ps.some((p) => p.img) ? `<h3 class="mono"><span>Edge lab: pixels vs. answers</span><span>real orbits</span></h3>
+      <p class="d">What if the satellite worked out the answer onboard instead of sending the whole picture down? Pick a photo above, then:</p>
+      <button class="run mono" id="runlab">Follow this photo to the ground →</button><div id="lab"></div>` : ''}`
+      : '<h3 class="mono">No public photo this week</h3><p class="note">Sentinel-2 revisits every few days; clouds or timing can leave a week empty.</p>'}
+    <h3 class="mono"><span>What each pass means</span><span>tap to filter</span></h3>
+    <div class="cats">${Object.entries(CATS).map(([k, c]) => `<button class="cat ${filter === k ? 'on' : ''}" data-cat="${k}"><span class="n" style="color:${c.c}">${count(k)}</span><span class="t">${c.t}</span><span class="d">${c.d}</span></button>`).join('')}</div>
+    <h3 class="mono"><span>The week, hour by hour</span><span>shaded = daylight here</span></h3>
+    <canvas id="tl"></canvas>
+    <div class="legend mono">${Object.entries(CATS).map(([, c]) => `<span><i style="background:${c.c}"></i>${c.t}</span>`).join('')}</div>
+    <h3 class="mono"><span>${filter ? CATS[filter].t : 'Every satellite'}</span><span>${sats.length}</span></h3>
+    <ul class="sats">${sats.slice(0, 12).map(satRow).join('')}</ul>
+    ${sats.length > 12 ? `<button class="more mono" id="more">Show all ${sats.length}</button>` : ''}
+    ${geo.length ? `<h3 class="mono"><span>Watching nonstop</span><span>${geo.length}</span></h3><ul class="sats">${geo.map((g) => `<li><span class="dot" style="background:#f2b33d"></span><span><span class="nm">${esc(g.s.name)}</span><br><span class="meta">${esc(operator(g.s.name))} · parked ${Math.abs(g.p.lng).toFixed(1)}°${g.p.lng < 0 ? 'W' : 'E'} · ${Math.round(g.e)}° up in your sky</span></span><span class="cnt">∞<small>always</small></span></li>`).join('')}</ul>` : ''}
+    <p class="note">A pass is the moment a satellite came closest to this spot, computed in your browser from public orbital elements; older passes are approximate. "Off to the side" is the angle from straight down. Photos are Copernicus Sentinel-2 previews of the whole 110 km tile.</p>`;
+  bind(sats);
+  timeline();
+}
+
+function satRow(g) {
+  const last = g.ps[0];
+  return `<li data-n="${esc(g.s.name)}"><span class="dot" style="background:${CATS[g.cat].c}"></span>
+    <span><span class="nm">${esc(g.s.name)}</span><br><span class="meta">${esc(operator(g.s.name) || g.s.group)} · last ${ago(last.at)} · closest ${Math.round(g.close)} km off</span></span>
+    <span class="cnt">${g.ps.length}<small>passes</small></span></li>`;
+}
+
+function bind(sats) {
+  const st = $('story');
+  st.querySelectorAll('.cat').forEach((b) => (b.onclick = () => { state.filter = state.filter === b.dataset.cat ? null : b.dataset.cat; render(); }));
+  st.querySelectorAll('.strip img').forEach((im) => (im.onclick = () => {
+    const m = state.imgs[im.dataset.i];
+    $('heroimg').src = m.src; $('herocap').textContent = `${m.plat} · ${day(m.t)}`; $('herosub').textContent = `${m.cloud}% cloud · 10 m per pixel · ${ago(m.t)} · hover to zoom`;
+    st.querySelectorAll('.strip img').forEach((x) => x.classList.toggle('on', x === im));
+    const p = state.ps.find((x) => x.img === m); if (p) replay(p);
+  }));
+  st.querySelectorAll('.sats li[data-n]').forEach((li) => (li.onclick = () => replay(state.ps.filter((p) => p.s.name === li.dataset.n).sort((a, b) => 'plco'.indexOf(a.cat[0]) - 'plco'.indexOf(b.cat[0]) || a.d - b.d)[0])));
+  $('runlab')?.addEventListener('click', () => { const sel = state.imgs[st.querySelector('.strip img.on').dataset.i], p = state.ps.find((x) => x.img === sel) ?? state.ps.find((x) => x.img); replay(p); edgeLab(p); });
+  $('more')?.addEventListener('click', (e) => { e.target.remove(); st.querySelector('.sats').innerHTML = sats.map(satRow).join(''); bind(sats); });
+}
+
+// Fly the satellite over the spot again: its track ±8 min, a moving marker, and a line down to the ground.
+let anim = 0;
+function replay(p) {
+  cancelAnimationFrame(anim);
+  document.querySelectorAll('.sats li').forEach((li) => li.classList.toggle('on', li.dataset.n === p.s.name));
+  const track = [];
+  for (let t = p.at - 48e4; t <= p.at + 48e4; t += 1e4) { const w = where(p.s.rec, t); if (w) track.push([w.lat, w.lng, w.h / R]); }
+  globe.pathsData([track]).pointOfView({ lat: state.here.lat, lng: state.here.lng, altitude: 1.1 }, 900);
+  const c = CATS[p.cat].c, t0 = performance.now(), base = { lat: state.here.lat, lng: state.here.lng, c: '#7cf2c8', alt: 0.005, r: 0.35 };
+  const step = (now) => {
+    const k = ((now - t0) % 6000) / 6000, w = where(p.s.rec, p.at - 48e4 + k * 96e4);
+    if (w) globe.pointsData([base, { lat: w.lat, lng: w.lng, alt: w.h / R, c, r: 0.6 }]);
+    anim = requestAnimationFrame(step);
+  };
+  anim = requestAnimationFrame(step);
+  tip(`${p.s.name} · ${day(p.at)} · ${Math.round(p.offNadir)}° off to the side · ${Math.round(p.d)} km away · ${CATS[p.cat].t}`);
+}
+
+function tip(text, x, y) {
+  const el = $('tip');
+  el.textContent = text; el.hidden = !text;
+  Object.assign(el.style, x == null ? { left: '24px', top: 'auto', bottom: '44px' } : { left: `${x + 12}px`, top: `${y + 12}px`, bottom: 'auto' });
+}
+
+function timeline() {
+  const cv = $('tl'), dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d'); g.scale(dpr, dpr);
+  const end = Date.now(), start = end - DAYS * 864e5, x = (t) => ((t - start) / (end - start)) * W, rows = Object.keys(CATS), rowY = (c) => 16 + rows.indexOf(c) * 24;
+  g.fillStyle = 'rgba(242,179,61,.07)';
+  for (let t = start; t < end; t += 9e5) if (sunUp(state.here, t)) g.fillRect(x(t), 0, x(t + 9e5) - x(t) + 0.5, H - 18);
+  g.fillStyle = '#8a93a6'; g.font = '10px IBM Plex Mono';
+  for (let d = new Date(start).setHours(24, 0, 0, 0); d < end; d += 864e5) { g.fillRect(x(d), 0, 1, H - 18); g.fillText(new Date(d).toLocaleDateString(undefined, { weekday: 'short' }).toUpperCase(), x(d) + 3, H - 4); }
+  const dots = state.ps.filter((p) => !state.filter || p.cat === state.filter).map((p) => ({ p, X: x(p.at), Y: rowY(p.cat) }));
+  for (const d of dots) { g.fillStyle = CATS[d.p.cat].c; g.globalAlpha = d.p.cat === 'photo' ? 1 : 0.55; g.beginPath(); g.arc(d.X, d.Y, d.p.cat === 'photo' ? 4 : 2, 0, 7); g.fill(); }
+  g.globalAlpha = 1;
+  const near = (e) => { const r = cv.getBoundingClientRect(); return dots.reduce((b, d) => { const k = Math.hypot(d.X - (e.clientX - r.left), d.Y - (e.clientY - r.top)); return k < (b?.k ?? 10) ? { ...d, k } : b; }, null); };
+  cv.onmousemove = (e) => { const d = near(e); tip(d ? `${d.p.s.name} · ${day(d.p.at)} · ${CATS[d.p.cat].t}` : '', e.clientX, e.clientY); };
+  cv.onmouseleave = () => tip('');
+  cv.onclick = (e) => { const d = near(e); if (d) replay(d.p); };
+}
+
+// ---------- intro controls ----------
+$('search').onsubmit = async (e) => {
+  e.preventDefault();
+  const q = $('q').value.trim(); if (!q) return;
+  const [hit] = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`).then((r) => r.json()).catch(() => []);
+  hit ? go(+hit.lat, +hit.lon, hit.display_name.split(',').slice(0, 2).join(',')) : ($('q').value = '', $('q').placeholder = 'Not found. Try another place');
+};
+document.querySelectorAll('[data-ll]').forEach((b) => (b.onclick = () => { const [la, ln] = b.dataset.ll.split(',').map(Number); go(la, ln, b.dataset.n); }));
+$('me').onclick = () => navigator.geolocation.getCurrentPosition((p) => go(p.coords.latitude, p.coords.longitude, 'Near you'));
+$('back').onclick = () => { cancelAnimationFrame(anim); document.body.className = ''; tip(''); $('panel').hidden = true; $('intro').classList.remove('gone'); globe.pathsData([]).pointsData([]).ringsData([]).arcsData([]); globe.controls().autoRotate = true; history.replaceState(null, '', location.pathname); };
+const q = new URLSearchParams(location.search);
+if (q.get('q')) { const [la, ln] = q.get('q').split(',').map(Number); go(la, ln, q.get('n') || q.get('q')); }
