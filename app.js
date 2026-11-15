@@ -1,5 +1,5 @@
 import Globe from 'https://cdn.jsdelivr.net/npm/globe.gl@2.46.2/+esm';
-import { sat, R, RAD, where, dist, elev } from './orbit.js';
+import { sat, R, RAD, where, dist, elev, passesOf } from './orbit.js';
 
 const DAYS = 7;
 const GROUPS = ['resource', 'weather', 'planet'];
@@ -82,17 +82,91 @@ const watchers = (list, here) => list.filter((s) => s.geo).map((s) => ({ s, p: w
 async function photos(here) {
   const body = { collections: ['sentinel-2-l2a'], intersects: { type: 'Point', coordinates: [here.lng, here.lat] }, datetime: `${new Date(Date.now() - DAYS * 864e5).toISOString()}/${new Date().toISOString()}`, limit: 20 };
   const r = await fetch('https://earth-search.aws.element84.com/v1/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null);
-  return r?.ok ? (await r.json()).features.map((f) => ({ t: Date.parse(f.properties.datetime), plat: f.properties.platform.toUpperCase(), cloud: Math.round(f.properties['eo:cloud_cover']), src: f.assets.thumbnail.href })) : [];
+  return r?.ok ? (await r.json()).features.map((f) => ({ t: Date.parse(f.properties.datetime), plat: f.properties.platform.toUpperCase(), cloud: Math.round(f.properties['eo:cloud_cover']), src: f.assets.thumbnail.href, tile: f.properties['grid:code'] ?? f.id.split('_')[1] })) : [];
+}
+
+// ---------- NASA GIBS: daily true-colour images and live weather-satellite views (free, no key) ----------
+const DAILY = [['MODIS_Terra_CorrectedReflectance_TrueColor', 'TERRA', 250], ['MODIS_Aqua_CorrectedReflectance_TrueColor', 'AQUA', 250], ['VIIRS_NOAA20_CorrectedReflectance_TrueColor', 'NOAA 20', 375], ['VIIRS_NOAA21_CorrectedReflectance_TrueColor', 'NOAA 21', 375]];
+const gibs = (layer, bbox, time) => `https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=${layer}&CRS=EPSG:4326&BBOX=${bbox}&WIDTH=512&HEIGHT=512&FORMAT=image/jpeg&TIME=${time}`;
+const bbox = (here, km) => { const dl = km / 111, dn = dl / Math.cos(here.lat * RAD); return [here.lat - dl, here.lng - dn, here.lat + dl, here.lng + dn].map((v) => v.toFixed(3)).join(','); };
+const fetchImg = async (url) => { const r = await fetch(url).catch(() => null), b = r?.ok && (await r.blob()); return b && b.size > 4000 ? URL.createObjectURL(b) : null; }; // tiny = empty tile
+async function dailyPhotos(here) {
+  const box = bbox(here, 100), jobs = [];
+  for (let d = 1; d <= DAYS; d++) for (const [layer, plat, m] of DAILY) jobs.push({ plat, m, day: new Date(Date.now() - d * 864e5).toISOString().slice(0, 10), layer });
+  const got = await Promise.all(jobs.map(async (j) => { const src = await fetchImg(gibs(j.layer, box, j.day)); return src && { ...j, src, t: Date.parse(`${j.day}T12:00:00Z`), daily: true }; }));
+  return got.filter(Boolean);
+}
+// The newest picture from the geostationary satellite above this longitude (they publish every 10 min, ~40–90 min late).
+async function liveView(here) {
+  const [layer, name, waits] = here.lng > -130 && here.lng < -20 ? ['GOES-East_ABI_GeoColor', 'GOES-East', [90, 120, 150]] : here.lng <= -130 || here.lng > 160 ? ['GOES-West_ABI_GeoColor', 'GOES-West', [90, 120, 150]] : here.lng > 80 ? ['Himawari_AHI_Band3_Red_Visible_1km', 'Himawari-9', [40, 60, 90, 120]] : [];
+  for (const m of waits ?? []) {
+    const t = new Date(Date.now() - m * 6e4); t.setUTCMinutes(Math.floor(t.getUTCMinutes() / 10) * 10, 0, 0);
+    const src = await fetchImg(gibs(layer, bbox(here, 600), t.toISOString().slice(0, 19) + 'Z'));
+    if (src) return { name, src, t: t.getTime() };
+  }
+  return null;
+}
+
+// ---------- next clear look: future passes of detailed imagers + the cloud forecast ----------
+async function nextLooks(list, here) {
+  const now = Date.now(), looks = list.filter((s) => /^(SENTINEL-2|LANDSAT [89])/.test(s.name))
+    .flatMap((s) => passesOf(s, here, now, now + 9 * 864e5).filter((p) => p.cat === 'likely' && sunUp(here, p.at)).map((p) => ({ ...p, s })));
+  const ts = (await fetch(`https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${here.lat.toFixed(3)}&lon=${here.lng.toFixed(3)}`).then((r) => r.json()).catch(() => null))?.properties.timeseries ?? [];
+  for (const l of looks) {
+    const near = ts.reduce((b, x) => (!b || Math.abs(Date.parse(x.time) - l.at) < Math.abs(Date.parse(b.time) - l.at) ? x : b), null);
+    l.cloud = near && Math.abs(Date.parse(near.time) - l.at) <= 3 * 36e5 ? Math.round(near.data.instant.details.cloud_area_fraction) : null;
+  }
+  return looks.sort((a, b) => a.at - b.at);
+}
+const sky = (c) => (c == null ? ['no forecast yet', '#8a93a6'] : c <= 30 ? ['clear', '#7cf2c8'] : c <= 70 ? ['partly cloudy', '#f2b33d'] : ['cloudy', '#e2564a']);
+
+// ---------- what changed: pixel difference between two photos, then the model names the change ----------
+const loadImg = async (src) => { const im = new Image(); im.crossOrigin = 'anonymous'; im.src = src.startsWith('blob:') ? src : `${src}?pixels`; await im.decode(); return im; };
+const CG = 8;
+async function changes(a, b) {
+  const W = 240, cells = [], px = await Promise.all([a, b].map(async (m) => { const c = document.createElement('canvas'); c.width = c.height = W; const g = c.getContext('2d'); g.drawImage(await loadImg(m.src), 0, 0, W, W); return g.getImageData(0, 0, W, W).data; }));
+  const bad = (d, i) => { const hi = Math.max(d[i], d[i + 1], d[i + 2]); return hi < 12 || (hi > 150 && hi - Math.min(d[i], d[i + 1], d[i + 2]) < 45); }; // no data, or cloud incl. thin wisps
+  // Even out overall brightness and colour (haze, sun angle) so only local differences count.
+  const mean = px.map((d) => { const s = [0, 0, 0]; let n = 0; for (let i = 0; i < d.length; i += 4) if (!bad(px[0], i) && !bad(px[1], i)) { n++; for (let k = 0; k < 3; k++) s[k] += d[i + k]; } return s.map((v) => v / Math.max(n, 1)); });
+  const gain = [0, 1, 2].map((k) => mean[0][k] / Math.max(mean[1][k], 1));
+  for (let i = 0; i < px[1].length; i += 4) for (let k = 0; k < 3; k++) px[1][i + k] *= gain[k];
+  for (let cy = 0; cy < CG; cy++) for (let cx = 0; cx < CG; cx++) {
+    let n = 0; const s = [0, 0, 0, 0, 0, 0];
+    for (let y = cy * W / CG; y < (cy + 1) * W / CG; y++) for (let x = cx * W / CG; x < (cx + 1) * W / CG; x++) {
+      const i = (y * W + x) * 4;
+      if (bad(px[0], i) || bad(px[1], i)) continue;
+      n++; for (let k = 0; k < 3; k++) { s[k] += px[0][i + k]; s[k + 3] += px[1][i + k]; }
+    }
+    const diff = n > (W / CG) ** 2 / 3 ? Math.hypot(...[0, 1, 2].map((k) => (s[k] - s[k + 3]) / n)) : 0;
+    cells.push({ x: cx, y: cy, diff, changed: diff > 40 });
+  }
+  return cells;
+}
+async function nameChanges(a, b, cells) {
+  const m = await loadModel(), c = document.createElement('canvas'), g = c.getContext('2d'), labels = Object.values(LABELS).map((v) => `a satellite image of ${v}`), hit = cells.filter((x) => x.changed);
+  c.width = c.height = 224;
+  const read = async (img) => { const im = await loadImg(img.src), s = im.naturalWidth / CG; return (await m.clip(hit.map((h) => { g.drawImage(im, h.x * s, h.y * s, s, s, 0, 0, 224, 224); return c.toDataURL('image/jpeg', 0.9); }), labels)).map(([top]) => Object.keys(LABELS).find((k) => top.label.endsWith(LABELS[k]))); };
+  if (!hit.length) return [];
+  const [x, y] = [await read(a), await read(b)];
+  return Object.entries(hit.reduce((acc, _, i) => { if (x[i] !== y[i]) acc[`${x[i]} → ${y[i]}`] = (acc[`${x[i]} → ${y[i]}`] ?? 0) + 1; return acc; }, {}));
 }
 
 // ---------- edge lab: pixels vs. answers ----------
-// First moment after `from` that the satellite is 5°+ above a ground station's horizon.
-function contact(rec, from, limit = 6 * 36e5) {
-  for (let t = from; t < from + limit; t += 3e4) {
-    const p = where(rec, t);
-    const st = p && STATIONS.find((s) => elev(p, s) >= 5);
-    if (st) return { st, t, p };
+// Every ground-station contact in the next 12 h: start/end while the satellite is 5°+ above a station's horizon.
+function contacts(rec, from, hours = 12) {
+  const out = []; let cur = null;
+  for (let t = from; t < from + hours * 36e5; t += 2e4) {
+    const p = where(rec, t), st = p && STATIONS.find((s) => elev(p, s) >= 5);
+    if (st && cur?.st === st) cur.end = t;
+    else { if (cur) out.push(cur); cur = st ? { st, t, end: t, p } : null; }
   }
+  if (cur) out.push(cur);
+  return out;
+}
+// When is `mb` fully on the ground, at `mbps`, using `share` of each contact (the rest carries other data)?
+function delivered(cs, mb, mbps, share) {
+  let left = mb * 8;
+  for (const c of cs) { left -= mbps * share * ((c.end - c.t) / 1000 + 20); if (left <= 0) return c.end; }
   return null;
 }
 // Could the answer hop through another satellite that is talking to a ground station sooner?
@@ -172,7 +246,7 @@ function aiMap(im, ai) {
 async function edgeLab(p) {
   const box = $('lab');
   box.innerHTML = '<p class="big">Following the data down…</p>';
-  const list = await sats, raw = contact(p.s.rec, p.at);
+  const list = await sats, cs = contacts(p.s.rec, p.at), raw = cs[0];
   const hop = raw && (await relay(p.s, p.at, raw.t, list));
   const im = await photoPixels(p.img).catch(() => null), mix = im && (await analyse(im));
   const ai = im && (await aiRead(im, (t) => (box.innerHTML = `<p class="big">${t}</p>`)).catch((e) => (console.error(e), null)));
@@ -190,8 +264,33 @@ async function edgeLab(p) {
     <div class="edge mono"><span>Model<b>${ai.name}</b></span><span>Size<b>${ai.mb} MB</b></span><span>Load<b>${(ai.load / 1000).toFixed(1)} s</b></span><span>Per tile<b>${Math.round(ai.msPerTile)} ms</b></span><span>Tiles<b>${ai.tiles.length}</b></span></div>
     <p class="d">The model labels the ground in each tile; cloud cover (${mix?.cloud ?? '?'}%) comes from the pixel rules, which catch bright cloud better. CLIP is a general image model, not trained on satellite photos, so expect some wrong tiles.</p>` : '<p class="d">The vision model could not run in this browser, so the answer uses the colour rules only.</p>'}
     <p class="mono">The answer, as it would be sent</p><pre>${esc(JSON.stringify(JSON.parse(answer), null, 1))}</pre>
+    <h3 class="mono"><span>Mission planner</span><span>next 12 h of contacts</span></h3>
+    <p class="d">Plan the downlink like an operator: how fast is the radio, how much of each pass can this customer have, and how big is the job?</p>
+    <div class="ctl mono">
+      <label>Scene <select id="pl-mb"><option value="800">1 tile · 800 MB</option><option value="8000" selected>10 tiles · 8 GB</option><option value="80000">a day's strip · 80 GB</option></select></label>
+      <label>Radio <output id="pl-rate-o"></output><input id="pl-rate" type="range" min="1" max="520" value="520"></label>
+      <label>Share of each pass <output id="pl-share-o"></output><input id="pl-share" type="range" min="1" max="100" value="10"></label>
+    </div>
+    <div id="pl-out"></div><canvas id="pl-tl"></canvas>
+    <ol class="contacts mono">${cs.slice(0, 8).map((c) => `<li>${new Date(c.t).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} · ${esc(c.st.n)} · ${Math.max(1, Math.round((c.end - c.t) / 6e4))} min</li>`).join('') || '<li>No contact with these 11 stations in 12 h</li>'}</ol>${cs.length > 8 ? `<p class="mono">+ ${cs.length - 8} more contacts in the next 12 h</p>` : ''}
     <p class="note">${Math.round((RAW_MB * 1e6) / bytes).toLocaleString()}× smaller${ansT && raw && ansT < raw.t ? `, and ${Math.round((raw.t - ansT) / 6e4)} min sooner` : ''}. Times come from real orbits over ${STATIONS.length} public ground stations. The tile size, link rates and station list are stated assumptions; the satellite-to-satellite hop is hypothetical, since these satellites don't relay for each other today. The model runs on this device on the downloaded preview, standing in for software running on the satellite's own computer.</p>`;
   if (ai) aiMap(im, ai);
+  const plan = () => {
+    const mb = +$('pl-mb').value, rate = +$('pl-rate').value, share = $('pl-share').value / 100, done = delivered(cs, mb, rate, share), used = done ? cs.filter((c) => c.t <= done).length : cs.length;
+    $('pl-rate-o').textContent = `${rate} Mbit/s`; $('pl-share-o').textContent = `${Math.round(share * 100)}%`;
+    const span = (t) => { const m = Math.max(1, Math.round((t - p.at) / 6e4)); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`; };
+    $('pl-out').innerHTML = `<div class="duel"><div><p class="mono">Raw pixels</p><b class="num">${done ? span(done) : '12 h +'}</b><p>${done ? `fully on the ground after ${used} contact${used === 1 ? '' : 's'}` : `still not down after all ${cs.length} contacts`}</p></div>
+      <div><p class="mono">Onboard answer</p><b class="num">${ansT ? span(ansT) : '12 h +'}</b><p>${bytes} B, down on the ${hop ? 'relay' : 'first contact'}</p></div></div>`;
+    const cv = $('pl-tl'), W = cv.clientWidth, H = 54, x = (t) => ((t - p.at) / 432e5) * W, g = cv.getContext('2d'), dpr = devicePixelRatio || 1;
+    cv.width = W * dpr; cv.height = H * dpr; g.scale(dpr, dpr);
+    g.fillStyle = 'rgba(255,255,255,.06)'; g.fillRect(0, 22, W, 12);
+    cs.forEach((c) => { g.fillStyle = done && c.t <= done ? '#6aa8ff' : 'rgba(106,168,255,.35)'; g.fillRect(x(c.t), 18, Math.max(3, x(c.end) - x(c.t)), 20); });
+    g.fillStyle = '#7cf2c8'; if (ansT) g.fillRect(x(ansT) - 1, 10, 3, 36);
+    g.fillStyle = '#8a93a6'; g.font = '10px IBM Plex Mono';
+    for (let h = 0; h <= 12; h += 3) g.fillText(`+${h}h`, Math.min(x(p.at + h * 36e5) + 2, W - 26), 52);
+  };
+  ['pl-mb', 'pl-rate', 'pl-share'].forEach((id) => ($(id).oninput = plan));
+  plan();
 }
 
 // ---------- sun, for the timeline's daylight bands ----------
@@ -211,14 +310,20 @@ async function go(lat, lng, name) {
   $('intro').classList.add('gone'); document.body.className = 'results';
   $('panel').hidden = false;
   $('story').innerHTML = `<p class="mono">${lat.toFixed(4)}°, ${lng.toFixed(4)}°</p><div class="place">${esc(name)}</div><p class="big">Tracing a week of orbits…</p>`;
-  const [list, imgs] = await Promise.all([sats, photos(here)]);
+  const [list, imgs, daily] = await Promise.all([sats, photos(here), dailyPhotos(here)]);
   const ps = await passes(list, here, (i, n) => ($('story').querySelector('.big').textContent = `Tracing a week of orbits on ${n} cores… ${i} done`));
   for (const img of imgs) { // tie each archive photo to the pass that took it
     const p = ps.find((x) => x.s.name.startsWith(img.plat) && Math.abs(x.at - img.t) < 15 * 6e4);
     if (p) Object.assign(p, { cat: 'photo', img }); else img.orphan = true;
   }
-  state = { here, name, ps, imgs: imgs.sort((a, b) => a.cloud - b.cloud), geo: watchers(list, here), filter: null };
+  for (const d of daily) { // a daily image means that satellite's daytime pass that day really imaged this spot
+    const p = ps.find((x) => x.s.name.startsWith(d.plat) && x.cat === 'likely' && new Date(x.at).toISOString().startsWith(d.day) && sunUp(here, x.at));
+    if (p) Object.assign(p, { cat: 'photo', daily: d });
+  }
+  state = { here, name, ps, s2: imgs.length, imgs: [...imgs.sort((a, b) => a.cloud - b.cloud), ...daily.sort((a, b) => b.t - a.t)], geo: watchers(list, here), filter: null };
   render();
+  nextLooks(list, here).then((l) => { if (state.here === here) Object.assign(state, { looks: l }) && fillLooks(); });
+  liveView(here).then((v) => { if (state.here === here && $('live')) $('live').innerHTML = v ? `<figure class="hero" style="margin:0"><img src="${v.src}" alt="Live weather-satellite view"><figcaption><b>${v.name} · ${day(v.t)}</b><span class="mono">live view · refreshes every 10 min · ${ago(v.t)}</span></figcaption></figure>` : '<p class="note">No free live view covers this longitude (Europe, Africa and the Indian Ocean need Meteosat, which NASA GIBS does not serve).</p>'; });
 }
 
 function render() {
@@ -233,11 +338,15 @@ function render() {
     <p class="mono">${here.lat.toFixed(4)}°, ${here.lng.toFixed(4)}°</p>
     <div class="place">${esc(name)}</div>
     <p class="big">In the last 7 days, <b>${new Set(ps.map((p) => p.s.name)).size}</b> satellites came over ${esc(name)}.</p>
-    <p class="mono">${ps.length} passes · ${imgs.length} public photo${imgs.length === 1 ? '' : 's'} · ${geo.length} watching nonstop</p>
+    <p class="mono">${ps.length} passes · ${imgs.length} public photos (${state.s2} detailed, ${imgs.length - state.s2} daily) · ${geo.length} watching nonstop</p>
+    <h3 class="mono"><span>Next clear look</span><span>cloud forecast: MET Norway</span></h3>
+    <div id="looks"><p class="d">Working out the next detailed passes over ${esc(name)}…</p></div>
     ${best ? `<h3 class="mono"><span>The clearest look</span><span>${imgs.length} photos</span></h3>
-      <figure class="hero" style="margin:0"><img id="heroimg" src="${esc(best.src)}" alt="Sentinel-2 photo of ${esc(name)}">
-        <figcaption><b id="herocap">${esc(best.plat)} · ${day(best.t)}</b><span class="mono" id="herosub">${best.cloud}% cloud · 10 m per pixel · ${ago(best.t)} · hover to zoom</span></figcaption></figure>
-      <div class="strip">${imgs.map((m, i) => `<img src="${esc(m.src)}" data-i="${i}" class="${i ? '' : 'on'}" alt="">`).join('')}</div>
+      <figure class="hero" style="margin:0"><img id="heroimg" src="${esc(best.src)}" alt="Satellite photo of ${esc(name)}">
+        <figcaption><b id="herocap"></b><span class="mono" id="herosub"></span></figcaption></figure>
+      <div class="strip">${imgs.map((m, i) => `<img src="${esc(m.src)}" data-i="${i}" class="${i ? '' : 'on'} ${m.daily ? 'daily' : ''}" alt="" title="${esc(m.plat)}">`).join('')}</div>
+      <p class="legend mono"><span><i style="background:#7cf2c8"></i>detailed · Sentinel-2, 10 m</span><span><i style="background:#6aa8ff"></i>daily · NASA, 250–375 m</span></p>
+      ${imgs.length > 1 ? `<h3 class="mono"><span>What changed</span><span>drag to compare</span></h3><div id="cmp"></div>` : ''}
       ${ps.some((p) => p.img) ? `<h3 class="mono"><span>Edge lab: pixels vs. answers</span><span>real orbits</span></h3>
       <p class="d">What if the satellite worked out the answer onboard instead of sending the whole picture down? Pick a photo above, then:</p>
       <button class="run mono" id="runlab">Follow this photo to the ground →</button><div id="lab"></div>` : ''}`
@@ -250,10 +359,59 @@ function render() {
     <h3 class="mono"><span>${filter ? CATS[filter].t : 'Every satellite'}</span><span>${sats.length}</span></h3>
     <ul class="sats">${sats.slice(0, 12).map(satRow).join('')}</ul>
     ${sats.length > 12 ? `<button class="more mono" id="more">Show all ${sats.length}</button>` : ''}
-    ${geo.length ? `<h3 class="mono"><span>Watching nonstop</span><span>${geo.length}</span></h3><ul class="sats">${geo.map((g) => `<li><span class="dot" style="background:#f2b33d"></span><span><span class="nm">${esc(g.s.name)}</span><br><span class="meta">${esc(operator(g.s.name))} · parked ${Math.abs(g.p.lng).toFixed(1)}°${g.p.lng < 0 ? 'W' : 'E'} · ${Math.round(g.e)}° up in your sky</span></span><span class="cnt">∞<small>always</small></span></li>`).join('')}</ul>` : ''}
-    <p class="note">A pass is the moment a satellite came closest to this spot, computed in your browser from public orbital elements; older passes are approximate. "Off to the side" is the angle from straight down. Photos are Copernicus Sentinel-2 previews of the whole 110 km tile.</p>`;
+    ${geo.length ? `<h3 class="mono"><span>Watching nonstop</span><span>${geo.length}</span></h3><div id="live"><p class="d">Fetching the latest view from orbit…</p></div><ul class="sats">${geo.map((g) => `<li><span class="dot" style="background:#f2b33d"></span><span><span class="nm">${esc(g.s.name)}</span><br><span class="meta">${esc(operator(g.s.name))} · parked ${Math.abs(g.p.lng).toFixed(1)}°${g.p.lng < 0 ? 'W' : 'E'} · ${Math.round(g.e)}° up in your sky</span></span><span class="cnt">∞<small>always</small></span></li>`).join('')}</ul>` : ''}
+    <p class="note">A pass is the moment a satellite came closest to this spot, computed in your browser from public orbital elements; older passes are approximate. "Off to the side" is the angle from straight down. Detailed photos are Copernicus Sentinel-2 previews of the whole 110 km tile; daily photos are NASA GIBS true-colour mosaics of a 200 km box.</p>`;
   bind(sats);
   timeline();
+  if (best) showPhoto(0);
+  if (state.looks) fillLooks();
+  if ($('cmp')) compare();
+}
+
+function showPhoto(i) {
+  const m = state.imgs[i];
+  $('heroimg').src = m.src;
+  $('herocap').textContent = `${m.plat} · ${m.daily ? new Date(m.t).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) : day(m.t)}`;
+  $('herosub').textContent = m.daily ? `daily image · ${m.m} m per pixel · 200 km wide · hover to zoom` : `${m.cloud}% cloud · 10 m per pixel · ${ago(m.t)} · hover to zoom`;
+  document.querySelectorAll('.strip img').forEach((x) => x.classList.toggle('on', +x.dataset.i === i));
+}
+
+function fillLooks() {
+  if (!$('looks')) return;
+  const ls = state.looks, next = ls.find((l) => l.cloud != null && l.cloud <= 30);
+  $('looks').innerHTML = ls.length ? `
+    <p class="big">${next ? `<b>${day(next.at)}</b>: ${esc(next.s.name)}, ~${next.cloud}% cloud forecast` : 'No clear detailed pass forecast in the next 9 days'}</p>
+    <ul class="looks">${ls.slice(0, 8).map((l) => { const [w, c] = sky(l.cloud); return `<li><span class="dot" style="background:${c}"></span><span><b>${day(l.at)}</b> · ${esc(l.s.name)}<br><span class="meta">${Math.round(l.d)} km off · ${l.cloud == null ? w : `${l.cloud}% cloud · ${w}`}</span></span></li>`; }).join('')}</ul>
+    <p class="note">Daylight passes where Sentinel-2 (10 m) or Landsat 8/9 (30 m) sweeps over this spot, from real orbits. Cloud forecast from MET Norway (yr.no) for the hour of the pass, up to ~9 days ahead.</p>`
+    : '<p class="d">No detailed imaging pass over this spot in the next 9 days.</p>';
+}
+
+// Before/after slider over two photos of the same view; the pixel difference marks changed areas, the model names them.
+async function compare() {
+  const { imgs } = state, s2 = imgs.filter((m) => !m.daily && m.cloud <= 50), byTile = Object.values(s2.reduce((o, m) => ((o[m.tile] ??= []).push(m), o), {})).find((g) => g.length > 1);
+  let pair = byTile?.slice(0, 2);
+  if (!pair) { // fall back to the two clearest daily images
+    const d = imgs.filter((m) => m.daily);
+    for (const m of d) m.cloud ??= (await analyse(await loadImg(m.src)).catch(() => ({ cloud: 100 }))).cloud;
+    // Same satellite only: different instruments render colour differently even when nothing changed.
+    pair = Object.values(d.reduce((o, m) => ((o[m.plat] ??= []).push(m), o), {})).filter((g) => g.length > 1)
+      .map((g) => g.sort((a, b) => a.cloud - b.cloud).slice(0, 2)).sort((x, y) => x[0].cloud + x[1].cloud - y[0].cloud - y[1].cloud)[0] ?? [];
+  }
+  if (pair.length < 2 || !$('cmp')) return;
+  const [a, b] = pair.sort((x, y) => x.t - y.t), when = (m) => new Date(m.t).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  $('cmp').innerHTML = `<div class="slide"><img src="${a.src}" alt="before"><div class="top"><img src="${b.src}" alt="after"></div><canvas id="cmp-cv"></canvas><input type="range" id="cmp-r" min="0" max="100" value="50" aria-label="Before and after"></div>
+    <p class="legend mono"><span>left: ${esc(a.plat)} · ${when(a)}</span><span>right: ${esc(b.plat)} · ${when(b)}</span></p>
+    <div id="cmp-out"><p class="d">Comparing pixels…</p></div>`;
+  const top = $('cmp').querySelector('.top'); $('cmp-r').oninput = (e) => (top.style.clipPath = `inset(0 0 0 ${e.target.value}%)`); $('cmp-r').oninput({ target: $('cmp-r') });
+  const cells = await changes(a, b), hit = cells.filter((c) => c.changed), cv = $('cmp-cv'), g = cv.getContext('2d');
+  cv.width = cv.height = 320; g.strokeStyle = '#f2b33d'; g.lineWidth = 2;
+  for (const c of hit) g.strokeRect(c.x * 40 + 1, c.y * 40 + 1, 38, 38);
+  $('cmp-out').innerHTML = `<p class="d"><b>${hit.length} of ${CG * CG}</b> areas changed noticeably (outlined). Cloud and no-data pixels are skipped; thin cloud, haze, shadows, water colour and season can still show up as change.</p>${!hit.length ? '' : a.daily ? '<p class="note">These are 250 m daily images, too coarse for the AI to name what changed, so it only runs on two detailed Sentinel-2 photos of the same tile (available for places Sentinel-2 imaged twice this week).</p>' : '<button class="run mono" id="cmp-ai">Ask the AI what changed →</button>'}<div id="cmp-ai-out"></div>`;
+  $('cmp-ai')?.addEventListener('click', async (e) => {
+    e.target.remove(); $('cmp-ai-out').innerHTML = '<p class="d">Model reading the changed areas in both photos…</p>';
+    const named = await nameChanges(a, b, cells).catch(() => null);
+    $('cmp-ai-out').innerHTML = named == null ? '<p class="d">The model could not run in this browser.</p>' : named.length ? `<ul class="looks">${named.map(([k, n]) => `<li><span class="dot" style="background:#f2b33d"></span><span><b>${esc(k)}</b><br><span class="meta">${n} area${n === 1 ? '' : 's'}</span></span></li>`).join('')}</ul><p class="note">CLIP is a general model, not trained on satellite photos; treat these as hints.</p>` : '<p class="d">The model sees the same kind of ground before and after; the change is likely light, season or haze.</p>';
+  });
 }
 
 function satRow(g) {
@@ -268,9 +426,8 @@ function bind(sats) {
   st.querySelectorAll('.cat').forEach((b) => (b.onclick = () => { state.filter = state.filter === b.dataset.cat ? null : b.dataset.cat; render(); }));
   st.querySelectorAll('.strip img').forEach((im) => (im.onclick = () => {
     const m = state.imgs[im.dataset.i];
-    $('heroimg').src = m.src; $('herocap').textContent = `${m.plat} · ${day(m.t)}`; $('herosub').textContent = `${m.cloud}% cloud · 10 m per pixel · ${ago(m.t)} · hover to zoom`;
-    st.querySelectorAll('.strip img').forEach((x) => x.classList.toggle('on', x === im));
-    const p = state.ps.find((x) => x.img === m); if (p) replay(p);
+    showPhoto(+im.dataset.i);
+    const p = state.ps.find((x) => x.img === m || x.daily === m); if (p) replay(p);
   }));
   st.querySelectorAll('.sats li[data-n]').forEach((li) => (li.onclick = () => replay(state.ps.filter((p) => p.s.name === li.dataset.n).sort((a, b) => 'plco'.indexOf(a.cat[0]) - 'plco'.indexOf(b.cat[0]) || a.d - b.d)[0])));
   if ($('runlab')) new IntersectionObserver((e, o) => { if (e[0].isIntersecting) { o.disconnect(); loadModel(); } }).observe($('runlab')); // warm the model while they read
